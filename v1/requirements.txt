@@ -1,0 +1,12 @@
+streamlit
+crewai
+crewai_tools
+langgraph
+langchain
+langchain_community
+langchain_core
+duckduckgo-search
+python-dotenv
+ollama
+typing_inspect
+typing_extensions
