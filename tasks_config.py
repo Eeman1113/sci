@@ -71,29 +71,32 @@ class ResearchTasks:
                 "2. Critically analyze all gathered information (snippets and fetched full content).\n"
                 "3. Synthesize the key insights, facts, arguments, and important data points relevant to the research questions.\n"
                 "4. Identify any conflicting information or significant gaps in the current data.\n"
-                "5. Extract any citable source details (URL, Title) for the insights you provide.\n"
-                "6. Based on your analysis, determine if the information is sufficient to write a comprehensive section, or if specific follow-up research questions are needed for more depth. If so, list those new questions."
+                "5. From the analyzed content, identify and extract details (Title, URL if available) of any sources that were cited or explicitly mentioned as references within the text. These are sources that the content itself refers to.\n"
+                "6. Based on your analysis, determine if the information is sufficient to write a comprehensive section, or if specific follow-up research questions are needed for more depth. If so, list those new questions.\n"
+                "VERY IMPORTANT: Your final output for this task MUST be a single well-formed JSON string. Ensure all text is properly escaped within the JSON."
             ),
             expected_output=(
-                "A structured response containing:\n"
-                "1. 'summary_of_insights': A detailed summary of the synthesized information and key findings.\n"
-                "2. 'gaps_and_conflicts': Notes on any identified gaps or conflicting information.\n"
-                "3. 'cited_sources': A list of sources (URL, Title) that contributed to the insights.\n"
-                "4. 'sufficiency_assessment': Your judgment on whether the information is sufficient.\n"
-                "5. 'follow_up_questions': A list of new, specific research questions if more depth is needed (or an empty list if sufficient)."
-                "The output should be a clear, well-organized text or JSON-like structure."
+                "A single, well-formed JSON string containing a dictionary with the following exact keys:\n"
+                "1. 'summary_of_insights': (string) A detailed summary of the synthesized information and key findings.\n"
+                "2. 'gaps_and_conflicts': (string) Notes on any identified gaps or conflicting information.\n"
+                "3. 'cited_sources': (list of dicts) A list of sources that YOU identified as contributing to your insights or were directly cited in the content you analyzed. Each dict should have 'title' and 'href' (if available, otherwise use 'N/A') keys.\n"
+                "4. 'sufficiency_assessment': (string) Your judgment on whether the information is sufficient (e.g., 'Sufficient for now', 'Needs more depth').\n"
+                "5. 'follow_up_questions': (list of strings) A list of new, specific research questions if more depth is needed. This MUST be a list of strings (e.g., [\"question1\", \"question2\"]). If no follow-up questions are needed, return an empty list []."
             ),
             agent=self.agents.analysis_agent(),
             async_execution=False,
         )
 
     def write_section_task(self, section_title: str, section_insights: str, cited_sources: list[dict]) -> Task:
-        sources_str = "\n".join([f"- {s['title']} ({s['href']})" for s in cited_sources]) if cited_sources else "No specific sources cited for this section draft."
+        sources_str = "\n".join([f"- Title: {s.get('title', 'N/A')}, URL: {s.get('href', 'N/A')}" for s in cited_sources]) if cited_sources else "No specific pre-identified sources provided for this section."
         return Task(
             description=(
                 f"Draft a comprehensive and detailed report section titled '{section_title}'.\n"
                 f"Base your writing on the following key insights and analysis summary:\n{section_insights}\n\n"
-                f"Refer to these sources if applicable during your writing:\n{sources_str}\n"
+                f"You have also been provided with the following pre-identified sources that may be relevant to this section:\n{sources_str}\n"
+                "During your writing, if appropriate, try to naturally incorporate information from these sources or cite them. "
+                "If direct in-text citation is complex, ensure you acknowledge their relevance or list them at the end of this section draft if they were significantly used. "
+                "The main goal is a well-written section based on the insights; reference integration is secondary but desireable if it enhances the content.\n\n"
                 "The writing style should be academic, clear, objective, and well-structured. "
                 "Ensure the section thoroughly covers the provided insights. "
                 "Do not just list the insights; elaborate on them, explain them, and connect them logically. "
