@@ -14,6 +14,10 @@ class SectionData(BaseModel):
     review_feedback: Optional[str] = None
     # Number of revision attempts for this section
     revision_attempts: int = 0
+    # Follow-up questions identified by Analysis Agent for recursive research
+    follow_up_questions: List[str] = Field(default_factory=list)
+    # Current recursion depth for this section
+    recursion_depth: int = 0
 
 class ResearchState(BaseModel):
     topic: str
@@ -47,6 +51,7 @@ class ResearchState(BaseModel):
     max_sources_per_search: int = 3 # How many search results to process
     max_revision_cycles_per_section: int = 2
     max_main_loop_iterations: int = 10 # To prevent infinite loops in overall process
+    max_recursion_depth_per_section: int = 2 # Max depth for recursive research on a single section
 
     # Fields for tracking progress or errors
     error_message: Optional[str] = None

@@ -126,17 +126,28 @@ def research_node(state: ResearchState, agents_cfg: ResearchAgents, tasks_cfg: R
         return {"error_message": "Research node: Current section not set or invalid."}
 
     state.current_status = f"Researching section: {section_title}"
-    state.event_log.append(state.current_status)
+    section_data_obj = state.sections_data[section_title]
 
-    # For simplicity, we'll assume questions are part of the section title or implicitly handled by the research agent.
-    # A more complex setup would pass specific questions from the planner.
-    # For now, the research task will use the section title to derive queries.
-    research_questions_for_section = [f"Key information about {section_title} related to {state.topic}"] # Simplified
+    # Determine research questions based on recursion state
+    if section_data_obj.recursion_depth > 0 and section_data_obj.follow_up_questions:
+        state.current_status += f" (Recursion depth: {section_data_obj.recursion_depth}, using {len(section_data_obj.follow_up_questions)} follow-up questions)"
+        research_questions_for_section = list(section_data_obj.follow_up_questions) # Make a copy to use
+        # Clear the follow-up questions from the state immediately after they are copied for use
+        state.sections_data[section_title].follow_up_questions = []
+        state.event_log.append(f"Cleared follow-up questions for section '{section_title}' after setting them for recursive research.")
+    else:
+        # Initial research questions (could be from planner or default)
+        # For now, using a generic question if not in recursion and no specific planned questions are loaded here.
+        # This part could be enhanced to pull initial questions from state.detailed_plan if available.
+        state.current_status += " (Initial research pass or no follow-up questions provided)"
+        research_questions_for_section = [f"Key information about {section_title} related to {state.topic}"]
+
+    state.event_log.append(state.current_status)
 
     research_agent_instance = agents_cfg.research_agent()
     research_task_instance = tasks_cfg.conduct_research_task(
         section_title=section_title,
-        research_questions=research_questions_for_section,
+        research_questions=research_questions_for_section, # Use dynamically determined questions
         existing_urls=list(state.all_collected_urls),
         existing_queries=list(state.all_search_queries),
         max_searches=state.max_searches_per_section
@@ -273,30 +284,56 @@ def analysis_node(state: ResearchState, agents_cfg: ResearchAgents, tasks_cfg: R
         # This is another point where robust JSON prompting for the LLM is crucial.
         
         insights_summary = "Analysis output was not in the expected format or was empty."
-        # follow_up_questions_from_analysis = [] # TODO: Implement recursive research trigger
+        follow_up_questions_from_analysis = [] # Initialize
 
         if isinstance(analysis_output_str, str) and analysis_output_str.strip():
             try:
-                # Attempt to parse if it's a JSON string
+                # Attempt to parse if it's a JSON string (as per updated task config)
                 analysis_result = json.loads(analysis_output_str)
                 insights_summary = analysis_result.get("summary_of_insights", insights_summary)
-                # cited_sources_from_analysis = analysis_result.get("cited_sources", [])
-                # TODO: Process cited_sources and add to state.references
-                # follow_up_questions_from_analysis = analysis_result.get("follow_up_questions", [])
+
+                # Extract cited sources from analysis and add to global list
+                cited_sources_from_analysis = analysis_result.get("cited_sources", [])
+                if isinstance(cited_sources_from_analysis, list):
+                    for source_dict in cited_sources_from_analysis:
+                        if isinstance(source_dict, dict):
+                            title = source_dict.get("title", "N/A")
+                            href = source_dict.get("href", "N/A")
+                            # Format as a string for state.references (List[str])
+                            ref_string = f"{title} ({href})"
+                            if ref_string not in state.references:
+                                state.references.append(ref_string)
+                else:
+                    state.event_log.append(f"Warning: 'cited_sources' from analysis was not a list for section '{section_title}'.")
+
+                # Extract follow-up questions
+                follow_up_questions_from_analysis = analysis_result.get("follow_up_questions", [])
+                if not isinstance(follow_up_questions_from_analysis, list):
+                    state.event_log.append(f"Warning: 'follow_up_questions' from analysis was not a list for section '{section_title}'. Treating as empty.")
+                    follow_up_questions_from_analysis = []
+
             except json.JSONDecodeError:
                 # If not JSON, use the raw string as summary (less ideal)
-                insights_summary = analysis_output_str
-                state.event_log.append(f"Warning: Analysis output for '{section_title}' was not valid JSON: {analysis_output_str[:200]}...")
+                insights_summary = analysis_output_str # Keep the raw output for manual inspection if needed
+                error_detail = f"Analysis output for '{section_title}' was not valid JSON. Content: {analysis_output_str[:200]}..."
+                state.event_log.append(f"Error: {error_detail}")
+                # Set error message to ensure it's caught by the router
+                state.error_message = f"Error in analysis_node: {error_detail}"
         
         state.sections_data[section_title].summary = insights_summary
-        state.current_status = f"Analysis complete for section: {section_title}"
+        state.sections_data[section_title].follow_up_questions = follow_up_questions_from_analysis
+
+        status_message = f"Analysis complete for section: {section_title}."
+        if follow_up_questions_from_analysis:
+            status_message += f" Identified {len(follow_up_questions_from_analysis)} follow-up questions."
+        state.current_status = status_message
         state.event_log.append(state.current_status)
 
         return {
-            "sections_data": state.sections_data,
+            "sections_data": state.sections_data, # This now includes follow_up_questions in the section data
             "current_status": state.current_status,
-            "event_log": state.event_log
-            # "follow_up_questions": follow_up_questions_from_analysis # For recursive research decision
+            "event_log": state.event_log,
+            "references": state.references # Pass updated references list
         }
     except Exception as e:
         error_msg = f"Error in analysis node for '{section_title}': {str(e)}"
@@ -457,45 +494,63 @@ def revision_node(state: ResearchState, agents_cfg: ResearchAgents, tasks_cfg: R
 # --- Conditional Edges ---
 
 def should_continue_overall_loop(state: ResearchState) -> Literal["process_next_section", "compile_report", "handle_error"]:
-    if state.error_message:
+    # Allow specific node errors to be handled by their local routers first if error_message is set
+    # Added "planner_node" to the exclusion list as planner errors are handled by its own router.
+    if state.error_message and not any(tag in state.error_message for tag in ["analysis_node", "review_node", "revision_node", "planner_node"]):
+        state.event_log.append(f"Overall Loop: Unhandled error detected: {state.error_message}. Halting.")
         return "handle_error"
     
-    processed_sections = [s_title for s_title, s_data in state.sections_data.items() if s_data.draft_content or s_data.summary] # Consider a section "processed" if it has a draft or at least a summary
-    
     if state.main_loop_iterations >= state.max_main_loop_iterations:
-        state.event_log.append("Max overall iterations reached. Moving to compile report.")
+        state.event_log.append(f"Max overall iterations ({state.max_main_loop_iterations}) reached. Moving to compile report.")
         return "compile_report"
 
-    # Find next section to process (one that doesn't have a draft_content yet)
     next_section_to_process = None
     if state.initial_outline:
-        for section_title in state.initial_outline:
-            # Check if this section has been meaningfully processed (e.g., has a draft)
-            # This logic might need refinement based on what "processed" means.
-            # For now, if it doesn't have draft_content, it needs processing.
-            if section_title in state.sections_data and not state.sections_data[section_title].draft_content:
-                # Also ensure it's not a section that only gets content during compilation (Intro, Conclusion, Refs)
-                # This is a simplification; Intro/Conclusion might also be drafted by agents.
-                if section_title.lower() not in ["introduction", "conclusion", "references"]:
-                    next_section_to_process = section_title
+        for sec_title in state.initial_outline:
+            # Ensure section exists in sections_data; it should if planner worked correctly
+            if sec_title not in state.sections_data:
+                state.event_log.append(f"Warning: Section '{sec_title}' from outline not found in sections_data. Skipping.")
+                continue
+
+            sec_data = state.sections_data[sec_title]
+            # Process if it's a content section (not intro/conclu/refs which are handled differently)
+            # AND it doesn't have a draft yet.
+            # The recursive handling (follow-up Qs) is managed by `decide_after_analysis`.
+            # This loop focuses on picking up entirely new, un-drafted sections.
+            if sec_title.lower() not in ["introduction", "conclusion", "references"] and not sec_data.draft_content:
+                # Check if it's already being processed due to recursion. If so, don't pick it as "next new".
+                # A section is "new" if its recursion depth is 0.
+                if sec_data.recursion_depth == 0: # Check only recursion_depth, follow_up_questions might be from a previous failed run
+                    next_section_to_process = sec_title
                     break
     
     if next_section_to_process:
         state.current_section_title = next_section_to_process
-        state.main_loop_iterations += 1 # Increment for each new section processing starts
+        # Ensure recursion_depth and follow_up_questions are reset for a truly new section pass
+        state.sections_data[next_section_to_process].recursion_depth = 0
+        state.sections_data[next_section_to_process].follow_up_questions = []
+        state.main_loop_iterations += 1
+        state.event_log.append(f"Overall Loop: Processing new section '{next_section_to_process}'. Iteration: {state.main_loop_iterations}.")
         return "process_next_section"
     else:
-        state.event_log.append("All planned sections processed or no more sections to process. Moving to compile report.")
+        state.event_log.append("Overall Loop: No new sections to process or all sections drafted/recursed. Moving to compile report.")
         return "compile_report"
 
 
 def decide_to_revise_or_continue(state: ResearchState) -> Literal["revise_section", "continue_to_next_main_task", "handle_error"]:
-    if state.error_message and "review_node" not in state.error_message and "revision_node" not in state.error_message : # if error is not from review/revise itself
-        return "handle_error"
-
     section_title = state.current_section_title
     if not section_title or section_title not in state.sections_data:
-        return "handle_error" # Should not happen if logic is correct
+        state.event_log.append(f"Error: current_section_title ('{section_title}') missing or invalid in decide_to_revise_or_continue.")
+        # Ensure error_message is set to trigger halt if not already set by a more specific error
+        if not state.error_message: # Avoid overwriting a more specific error
+            state.error_message = f"Critical error: current_section_title ('{section_title}') not set or invalid for review decision."
+        return "handle_error"
+
+    # Check for errors not originating from review/revise itself.
+    # Errors from review_node or revision_node are part of their specific loop/feedback mechanism.
+    if state.error_message and not any(err_tag in state.error_message.lower() for err_tag in ["review node", "revision node", "review_section_task", "revision_task"]): # more robust check
+        state.event_log.append(f"Error detected before revision decision for section '{section_title}': {state.error_message}. Halting.")
+        return "handle_error"
 
     section_data_obj = state.sections_data[section_title]
     feedback = section_data_obj.review_feedback
@@ -510,6 +565,52 @@ def decide_to_revise_or_continue(state: ResearchState) -> Literal["revise_sectio
             state.event_log.append(f"Section '{section_title}' approved or no actionable feedback. Continuing.")
         # This edge means we are done with this section's research-analyze-write-review cycle
         return "continue_to_next_main_task" # This will loop back to should_continue_overall_loop
+
+
+def decide_after_analysis(state: ResearchState) -> Literal["researcher", "writer", "handle_error"]:
+    """
+    Decides the next step after the analysis node.
+    Routes to 'researcher' for recursion if follow-up questions exist and depth limit not reached.
+    Otherwise, proceeds to 'writer'.
+    """
+    section_title = state.current_section_title
+    if not section_title or section_title not in state.sections_data:
+        error_msg = f"Error in decide_after_analysis: current_section_title ('{section_title}') is missing or invalid."
+        state.event_log.append(error_msg)
+        state.error_message = error_msg # Ensure this is set for global error handling
+        return "handle_error"
+
+    # Check for pre-existing errors, especially from analysis_node
+    if state.error_message and "analysis_node" in state.error_message:
+        # Error already logged by analysis_node, just route to handle_error
+        return "handle_error"
+
+    section_data_obj = state.sections_data[section_title]
+
+    if section_data_obj.follow_up_questions and \
+       section_data_obj.recursion_depth < state.max_recursion_depth_per_section:
+
+        state.sections_data[section_title].recursion_depth += 1
+        status_msg = f"Recursion {section_data_obj.recursion_depth}/{state.max_recursion_depth_per_section}: Starting deeper research for section '{section_title}' on {len(section_data_obj.follow_up_questions)} new questions."
+        state.current_status = status_msg
+        state.event_log.append(status_msg)
+        state.event_log.append(f"Recursive questions for '{section_title}': {section_data_obj.follow_up_questions}")
+        return "researcher"
+    else:
+        if section_data_obj.follow_up_questions:
+            status_msg = f"Max recursion depth ({state.max_recursion_depth_per_section}) reached for section '{section_title}', or no more recursion allowed. {len(section_data_obj.follow_up_questions)} follow-up questions will be cleared. Proceeding to writer."
+            state.current_status = status_msg
+            state.event_log.append(status_msg)
+            state.sections_data[section_title].follow_up_questions = [] # Clear questions
+        else:
+            status_msg = f"No follow-up questions for section '{section_title}'. Proceeding to writer."
+            state.current_status = status_msg
+            state.event_log.append(status_msg)
+
+        # Optionally reset recursion_depth here if desired when moving to writer.
+        # For now, depth is kept to show its final state for that section's processing cycle.
+        # state.sections_data[section_title].recursion_depth = 0
+        return "writer"
 
 
 # --- Final Report Compilation Node ---
@@ -563,7 +664,8 @@ def compile_report_node(state: ResearchState) -> Dict[str, Any]:
         introduction=state.sections_data.get("Introduction", SectionData(title="Introduction", draft_content=intro_content, raw_data=[])).draft_content or intro_content,
         sections_data=ordered_sections_data, # Pass the main content sections
         conclusion=state.sections_data.get("Conclusion", SectionData(title="Conclusion", draft_content=conclusion_content, raw_data=[])).draft_content or conclusion_content,
-        references_list=state.references # state.references should be populated by analysis/writing agents
+        references_list=state.references, # state.references should be populated by analysis/writing agents
+        topic=state.topic # Added topic for the subtitle in the report
     )
     
     state.final_report_md = final_report
@@ -659,7 +761,29 @@ def build_graph(agents_cfg: ResearchAgents, tasks_cfg: ResearchTasks):
 
     # Core section processing flow
     workflow.add_edge("researcher", "analyzer")
-    workflow.add_edge("analyzer", "writer")
+    # workflow.add_edge("analyzer", "writer") # Replaced by conditional edge below
+
+    # New conditional router after analysis to decide on recursion or writing
+    workflow.add_node("decide_after_analysis_router", lambda state: state) # Dummy node for routing logic
+
+    # Analyzer always goes to the decision router
+    workflow.add_conditional_edges(
+        "analyzer",
+        lambda state: "decide_after_analysis_router",
+        {"decide_after_analysis_router": "decide_after_analysis_router"}
+    )
+
+    # Conditional edges from the decision router
+    workflow.add_conditional_edges(
+        "decide_after_analysis_router",
+        decide_after_analysis, # New conditional function to handle recursion logic
+        {
+            "researcher": "researcher", # Loop back to researcher for recursive depth
+            "writer": "writer",         # Proceed to writer if no recursion needed
+            "handle_error": "error_handler"
+        }
+    )
+
     workflow.add_edge("writer", "reviewer")
 
     # Review and Revision Loop

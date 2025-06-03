@@ -10,3 +10,5 @@ python-dotenv
 ollama
 typing_inspect
 typing_extensions
+requests
+beautifulsoup4
